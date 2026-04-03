@@ -1,0 +1,9 @@
+[submodule "clap-sdk"]
+	path = clap-sdk
+	url = https://github.com/free-audio/clap.git
+[submodule "imgui"]
+	path = imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "clap-wrapper"]
+	path = clap-wrapper
+	url = https://github.com/free-audio/clap-wrapper.git
