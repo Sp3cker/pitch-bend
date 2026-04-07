@@ -1,5 +1,7 @@
 #include "plugin.h"
+#ifndef PITCH_BEND_NO_GUI
 #include "gui.h"
+#endif
 
 #include <clap/clap.h>
 #include <clap/ext/params.h>
@@ -9,7 +11,7 @@
 #include <clap/ext/note-ports.h>
 #include <clap/ext/gui.h>
 
-#include <algorithm>
+
 #include <cstdio>
 #include <cstring>
 
@@ -162,7 +164,7 @@ static void apply_param_value(PitchBendPlugin *self, clap_id id, double value) {
 }
 
 // Process one ready event and pass it through to out.
-static void handle_event(
+void handle_event(
 	PitchBendPlugin *self,
 	const clap_event_header_t *hdr,
 	const clap_output_events_t *out)
@@ -177,7 +179,23 @@ static void handle_event(
 		const auto *ne = reinterpret_cast<const clap_event_note_t *>(hdr);
 		const int channel = normalize_midi_channel(static_cast<int>(ne->channel));
 		const int key     = static_cast<int>(ne->key);
+
+		// Capture state before note_on mutates it.
+		GlideState prev_state = self->glide.state;
 		self->glide.note_on(key, channel);
+
+		// If the engine started gliding (legato transition), suppress the
+		// MIDI note-on — pitch bend alone handles the transition on the
+		// already-sounding note.
+		if (self->glide.state == GlideState::GLIDING &&
+		    (prev_state == GlideState::HELD || prev_state == GlideState::GLIDING)) {
+			// Legato: retarget bend only, no new note-on.
+			break;
+		}
+
+		// First note or non-glide: emit the MIDI note-on and remember it.
+		self->sounding_key     = key;
+		self->sounding_channel = channel;
 		emit_midi_message(
 			out,
 			hdr->time,
@@ -201,12 +219,19 @@ static void handle_event(
 			static_cast<int>(ne->key),
 			static_cast<int>(ne->channel),
 			&resolved_channel)) {
-			emit_midi_message(
-				out,
-				hdr->time,
-				static_cast<uint8_t>(0x80u | static_cast<unsigned>(resolved_channel)),
-				clamp_midi_data(static_cast<int>(ne->key)),
-				0);
+			// Only emit MIDI note-off when all notes are released, and
+			// release the sounding note (the one the synth actually knows
+			// about), not the finger that just lifted.
+			if (self->glide.note_count <= 0 && self->sounding_key >= 0) {
+				emit_midi_message(
+					out,
+					hdr->time,
+					static_cast<uint8_t>(0x80u | static_cast<unsigned>(self->sounding_channel)),
+					clamp_midi_data(self->sounding_key),
+					0);
+				self->sounding_key     = -1;
+				self->sounding_channel = -1;
+			}
 		}
 		break;
 	}
@@ -218,12 +243,16 @@ static void handle_event(
 			static_cast<int>(ne->key),
 			static_cast<int>(ne->channel),
 			&resolved_channel)) {
-			emit_midi_message(
-				out,
-				hdr->time,
-				static_cast<uint8_t>(0x80u | static_cast<unsigned>(resolved_channel)),
-				clamp_midi_data(static_cast<int>(ne->key)),
-				0);
+			if (self->glide.note_count <= 0 && self->sounding_key >= 0) {
+				emit_midi_message(
+					out,
+					hdr->time,
+					static_cast<uint8_t>(0x80u | static_cast<unsigned>(self->sounding_channel)),
+					clamp_midi_data(self->sounding_key),
+					0);
+				self->sounding_key     = -1;
+				self->sounding_channel = -1;
+			}
 		}
 		break;
 	}
@@ -236,15 +265,40 @@ static void handle_event(
 		uint8_t vel     = me->data[2];
 
 		if (status == 0x90u && vel > 0) {
+			GlideState prev_state = self->glide.state;
 			self->glide.note_on(static_cast<int>(key), static_cast<int>(channel));
+
+			if (self->glide.state == GlideState::GLIDING &&
+			    (prev_state == GlideState::HELD || prev_state == GlideState::GLIDING)) {
+				// Legato: bend-only, suppress the note-on pass-through.
+				break;
+			}
+
+			self->sounding_key     = static_cast<int>(key);
+			self->sounding_channel = static_cast<int>(channel);
+			out->try_push(out, hdr);
 		} else if (status == 0x80u || (status == 0x90u && vel == 0)) {
 			peeked_note_t peeked = self->ev_buf.peek_next_note_on();
 			if (peeked.found) {
 				self->glide.pre_target_glide(peeked.key, peeked.channel);
 			}
 			self->glide.note_off(static_cast<int>(key), static_cast<int>(channel));
+
+			if (self->glide.note_count <= 0 && self->sounding_key >= 0) {
+				// Emit note-off for the sounding key.
+				emit_midi_message(
+					out,
+					hdr->time,
+					static_cast<uint8_t>(0x80u | static_cast<unsigned>(self->sounding_channel)),
+					clamp_midi_data(self->sounding_key),
+					0);
+				self->sounding_key     = -1;
+				self->sounding_channel = -1;
+			}
+		} else {
+			// Other MIDI messages (CC, aftertouch, etc.) pass through.
+			out->try_push(out, hdr);
 		}
-		out->try_push(out, hdr);
 		break;
 	}
 
@@ -292,6 +346,9 @@ static bool plugin_activate(
 	self->block_start_sample  = 0;
 	self->last_bend_value     = 8192;
 	self->bend_decimate_counter = 0;
+	self->sounding_key        = -1;
+	self->sounding_channel    = -1;
+	self->was_playing         = false;
 
 	double lookahead_ms = self->params[static_cast<uint32_t>(ParamId::LOOKAHEAD_MS)]
 		.load(std::memory_order_relaxed);
@@ -320,6 +377,9 @@ static void plugin_reset(const clap_plugin_t *p) {
 	self->block_start_sample  = 0;
 	self->last_bend_value     = 8192;
 	self->bend_decimate_counter = 0;
+	self->sounding_key        = -1;
+	self->sounding_channel    = -1;
+	self->was_playing         = false;
 }
 
 // ─── Process ──────────────────────────────────────────────────────────────────
@@ -332,6 +392,24 @@ static clap_process_status plugin_process(
 	if (!self->active) return CLAP_PROCESS_SLEEP;
 
 	const uint32_t N = proc->frames_count;
+
+	// ── Transport-aware glide reset ──────────────────────────────────────────
+	// When playback starts (or restarts after a stop/pause), reset the glide
+	// engine so the first note doesn't glide from a stale pitch.
+	{
+		bool is_playing = false;
+		if (proc->transport) {
+			is_playing = (proc->transport->flags & CLAP_TRANSPORT_IS_PLAYING) != 0;
+		}
+		if (is_playing && !self->was_playing) {
+			self->glide.reset();
+			self->last_bend_value       = 8192;
+			self->bend_decimate_counter = 0;
+			self->sounding_key          = -1;
+			self->sounding_channel      = -1;
+		}
+		self->was_playing = is_playing;
+	}
 
 	// Sync parameter values into the glide engine.
 	sync_params_to_engine(self);
@@ -656,6 +734,8 @@ static const clap_plugin_note_ports_t PLUGIN_NOTE_PORTS = {
 
 // ─── Extension: GUI ──────────────────────────────────────────────────────────
 
+#ifndef PITCH_BEND_NO_GUI
+
 static bool gui_is_api_supported(
 	const clap_plugin_t *,
 	const char *api,
@@ -761,6 +841,7 @@ static const clap_plugin_gui_t PLUGIN_GUI = {
 	gui_show,
 	gui_hide,
 };
+#endif // PITCH_BEND_NO_GUI
 
 // ─── get_extension ───────────────────────────────────────────────────────────
 
@@ -770,7 +851,9 @@ static const void *plugin_get_extension(const clap_plugin_t *, const char *id) {
 	if (std::strcmp(id, CLAP_EXT_LATENCY)     == 0) return &PLUGIN_LATENCY;
 	if (std::strcmp(id, CLAP_EXT_AUDIO_PORTS) == 0) return &PLUGIN_AUDIO_PORTS;
 	if (std::strcmp(id, CLAP_EXT_NOTE_PORTS)  == 0) return &PLUGIN_NOTE_PORTS;
+#ifndef PITCH_BEND_NO_GUI
 	if (std::strcmp(id, CLAP_EXT_GUI)         == 0) return &PLUGIN_GUI;
+#endif
 	return nullptr;
 }
 

@@ -125,6 +125,34 @@ if(APPLE)
 	)
 endif()
 
+# ── Tests ─────────────────────────────────────────────────────────────────────
+enable_testing()
+
+add_executable(test_glide_engine
+	tests/test_glide_engine.cpp
+	src/glide_engine.cpp
+)
+target_include_directories(test_glide_engine PRIVATE src)
+target_compile_options(test_glide_engine PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+add_test(NAME glide_engine COMMAND test_glide_engine)
+
+add_executable(test_legato_routing
+	tests/test_legato_routing.cpp
+	src/plugin.cpp
+	src/glide_engine.cpp
+	src/event_buffer.cpp
+)
+target_include_directories(test_legato_routing PRIVATE
+	src
+	${clap_SOURCE_DIR}/include
+)
+target_compile_options(test_legato_routing PRIVATE -Wall -Wextra -Wno-unused-parameter)
+# Exclude GUI / ObjC symbols — the test doesn't need them.
+target_compile_definitions(test_legato_routing PRIVATE PITCH_BEND_NO_GUI=1)
+
+add_test(NAME legato_routing COMMAND test_legato_routing)
+
 # ── Install to user CLAP folder ───────────────────────────────────────────────
 if(APPLE)
 	install(TARGETS pitch_bend_glide

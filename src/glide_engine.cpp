@@ -31,9 +31,10 @@ void GlideEngine::note_on(int key, int channel) {
 	active_channel = channel;
 
 	bool do_glide = (glide_time_ms > 0.0) &&
-		(glide_mode == GlideMode::ALWAYS ||
-		 (glide_mode == GlideMode::LEGATO &&
-		  (state == GlideState::HELD || state == GlideState::GLIDING)));
+		(glide_mode == GlideMode::ALWAYS
+			? (last_note >= 0)
+			: (glide_mode == GlideMode::LEGATO &&
+			   (state == GlideState::HELD || state == GlideState::GLIDING)));
 
 	if (do_glide) {
 		// Snap src to current interpolated position so mid-glide re-targeting

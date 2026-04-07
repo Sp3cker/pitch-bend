@@ -54,6 +54,15 @@ struct PitchBendPlugin {
 	int      last_bend_value       = 8192;
 	uint32_t bend_decimate_counter = 0;
 
+	// Legato sounding-note tracking (audio thread only).
+	// During a glide, only the original note has a live MIDI note-on
+	// downstream.  Subsequent legato notes retarget the bend only.
+	int      sounding_key          = -1;
+	int      sounding_channel      = -1;
+
+	// Transport tracking (audio thread only).
+	bool     was_playing           = false;
+
 	// Set on audio thread; cleared on main thread via on_main_thread.
 	std::atomic<bool> notify_latency { false };
 
@@ -72,3 +81,10 @@ struct PitchBendPlugin {
 		return static_cast<PitchBendPlugin *>(p->plugin_data);
 	}
 };
+
+// Process one ready event and pass it through to out.
+// Exposed (non-static) for testing.
+void handle_event(
+	PitchBendPlugin *self,
+	const clap_event_header_t *hdr,
+	const clap_output_events_t *out);
